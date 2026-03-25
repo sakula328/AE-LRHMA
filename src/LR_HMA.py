@@ -6,7 +6,7 @@ import math
 import os
 import random
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
 import torch
 import torch.nn as nn
@@ -96,6 +96,8 @@ class LRHMA:
         ae_lr=1e-3,
         random_state=42,
         device=None,
+        encoding_mode="integer",  #（修改）
+        cat_perm_seed = None,     #修改
     ):
         self.k = int(k)
         self.e = int(e)
@@ -106,6 +108,13 @@ class LRHMA:
         self.random_state = random_state
 
         self.max_group_size = max_group_size if max_group_size is not None else 3 * self.k
+
+        #增加三个参数 + 存 encoder（修改）
+        self.encoding_mode = encoding_mode
+        self.cat_perm_seed = cat_perm_seed
+
+        self.onehot = None
+        self.cat_categories_ = {}  # 存每个类别列的 categories（保证 fit/transform 一致）
 
         # 隐私增强参数
         self.alpha_max = alpha_max
@@ -165,54 +174,88 @@ class LRHMA:
         return data_clean
 
     # ========= 特征矩阵 =========
-    def _prepare_features(self, data, fit=False):
+    def _prepare_features(self, data, fit=False):#（修改）
         quasi_data = data[self.quasi_identifiers]
 
+        # 1) split numeric / categorical
         if fit:
-            numeric_columns = [
-                col for col in self.quasi_identifiers
-                if pd.api.types.is_numeric_dtype(quasi_data[col])
-            ]
-            categorical_columns = [col for col in self.quasi_identifiers
-                                   if col not in numeric_columns]
+            numeric_columns = [c for c in self.quasi_identifiers
+                               if pd.api.types.is_numeric_dtype(quasi_data[c])]
+            categorical_columns = [c for c in self.quasi_identifiers if c not in numeric_columns]
             self.numeric_columns = numeric_columns
             self.categorical_columns = categorical_columns
-
-            normalized_data = np.zeros((len(data), len(self.quasi_identifiers)), dtype=float)
-
-            if numeric_columns:
-                numeric_values = self.scaler.fit_transform(quasi_data[numeric_columns])
-                for i, col in enumerate(self.quasi_identifiers):
-                    if col in numeric_columns:
-                        col_idx = numeric_columns.index(col)
-                        normalized_data[:, i] = numeric_values[:, col_idx]
-
-            for i, col in enumerate(self.quasi_identifiers):
-                if col in categorical_columns:
-                    encoded = pd.Categorical(quasi_data[col]).codes
-                    normalized_data[:, i] = encoded.astype(float)
-
         else:
             numeric_columns = self.numeric_columns
             categorical_columns = self.categorical_columns
             if numeric_columns is None:
                 raise RuntimeError("必须先调用 _prepare_features(..., fit=True)")
 
-            normalized_data = np.zeros((len(data), len(self.quasi_identifiers)), dtype=float)
+        # 2) numeric part
+        X_num = None
+        if numeric_columns:
+            if fit:
+                X_num = self.scaler.fit_transform(quasi_data[numeric_columns])
+            else:
+                X_num = self.scaler.transform(quasi_data[numeric_columns])
 
-            if numeric_columns:
-                numeric_values = self.scaler.transform(quasi_data[numeric_columns])
-                for i, col in enumerate(self.quasi_identifiers):
-                    if col in numeric_columns:
-                        col_idx = numeric_columns.index(col)
-                        normalized_data[:, i] = numeric_values[:, col_idx]
+        # 3) categorical part
+        if self.encoding_mode.lower() == "onehot":
+            if fit:
+                try:
+                    self.onehot = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+                except TypeError:
+                    self.onehot = OneHotEncoder(handle_unknown="ignore", sparse=False)
+                X_cat = self.onehot.fit_transform(quasi_data[categorical_columns]) if categorical_columns else None
+            else:
+                X_cat = self.onehot.transform(quasi_data[categorical_columns]) if categorical_columns else None
 
-            for i, col in enumerate(self.quasi_identifiers):
-                if col in categorical_columns:
-                    encoded = pd.Categorical(quasi_data[col]).codes
-                    normalized_data[:, i] = encoded.astype(float)
+            # concat
+            if X_num is None and X_cat is None:
+                return np.zeros((len(data), 0), dtype=float)
+            if X_num is None:
+                return X_cat.astype(float)
+            if X_cat is None:
+                return X_num.astype(float)
+            return np.hstack([X_num, X_cat]).astype(float)
 
-        return normalized_data
+        # ------------- integer mode (default) -------------
+        # 4) integer encoding with optional permutation + stable categories
+        X_cat_int = None
+        if categorical_columns:
+            if fit:
+                rng = np.random.RandomState(self.cat_perm_seed) if self.cat_perm_seed is not None else None
+                codes_list = []
+                for col in categorical_columns:
+                    cats = pd.Series(quasi_data[col]).astype("category").cat.categories.tolist()
+                    # optional permutation
+                    if rng is not None:
+                        cats = list(cats)
+                        rng.shuffle(cats)
+                    self.cat_categories_[col] = cats
+
+                    # stable coding
+                    codes = pd.Categorical(quasi_data[col], categories=cats).codes.astype(float).reshape(-1, 1)
+                    codes_list.append(codes)
+                X_cat_int = np.hstack(codes_list) if codes_list else None
+            else:
+                codes_list = []
+                for col in categorical_columns:
+                    cats = self.cat_categories_.get(col, None)
+                    if cats is None:
+                        # fallback (shouldn't happen if fit=True ran)
+                        cats = pd.Series(quasi_data[col]).astype("category").cat.categories.tolist()
+                    codes = pd.Categorical(quasi_data[col], categories=cats).codes.astype(float).reshape(-1, 1)
+                    codes_list.append(codes)
+                X_cat_int = np.hstack(codes_list) if codes_list else None
+
+        # 5) concat numeric + integer-cat
+        if X_num is None and X_cat_int is None:
+            return np.zeros((len(data), 0), dtype=float)
+        if X_num is None:
+            return X_cat_int.astype(float)
+        if X_cat_int is None:
+            return X_num.astype(float)
+        return np.hstack([X_num, X_cat_int]).astype(float)
 
     # ========= Phase 0：自编码器表示学习 =========
     def _train_representation_encoder(self):
@@ -249,6 +292,10 @@ class LRHMA:
             if (epoch + 1) % max(1, self.ae_epochs // 5) == 0:
                 print(f"    [AE] Epoch {epoch+1}/{self.ae_epochs}, loss={epoch_loss:.6f}")
         print("  [AE] 训练完成。")
+        print("[DEBUG] encoding_mode =", self.encoding_mode, "cat_perm_seed =", self.cat_perm_seed)
+        print("[DEBUG] numeric_columns =", self.numeric_columns)
+        print("[DEBUG] categorical_columns =", self.categorical_columns)
+        print("[DEBUG] X shape =", X.shape)
 
     def _encode_to_latent(self):
         X = self._prepare_features(self.data_, fit=False)
@@ -796,7 +843,7 @@ if __name__ == "__main__":
     k = 8
     e = 3
     # 原始数据文件（放在和 LR-HMA.py 同一文件夹下）
-    excel_file = "a_head10000.xlsx"
+    excel_file = "head10000.xlsx"
     sheet_name = "Sheet1"
 
     # ===== 2. 创建算法实例 =====

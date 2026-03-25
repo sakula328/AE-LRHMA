@@ -88,10 +88,12 @@ class APMCAAlgorithmParallel:
         return total_variance
 
     def _get_numeric_columns(self, data):
-        """获取数值型列"""
-        numeric_columns = ['age', 'balance', 'day', 'duration', 'campaign', 'pdays', 'previous']
-        numeric_columns = ['age', 'job', 'marital', 'education', 'balance', 'duration', 'campaign']
-        return [col for col in numeric_columns if col in data.columns and pd.api.types.is_numeric_dtype(data[col])]
+        # 只把真正连续数值当 numeric（按你的 QI）
+        numeric_candidates = ['age', 'duration', 'campaign']
+        return [
+            c for c in numeric_candidates
+            if c in data.columns and pd.api.types.is_numeric_dtype(data[c])
+        ]
 
     def select_attribute_for_perturbation(self, data, variance_info, numeric_columns):
         """基于方差选择划分属性"""
@@ -268,15 +270,51 @@ class APMCAAlgorithmParallel:
                 clusters = self.k_means_clustering(subset, num_clusters, numeric_columns)
 
                 # 泛化每个簇
-                generalized_clusters = []
-                valid_clusters = []
-                for cluster in clusters:
-                    if len(cluster) >= self.k:  # 确保满足k-匿名性
-                        generalized = self.generalize_cluster(cluster, [], sensitive_attr)
-                        generalized_clusters.append(generalized)
-                        valid_clusters.append(cluster)
+                # generalized_clusters = []
+                # valid_clusters = []
+                # for cluster in clusters:
+                #     if len(cluster) >= self.k:  # 确保满足k-匿名性
+                #         generalized = self.generalize_cluster(cluster, [], sensitive_attr)
+                #         generalized_clusters.append(generalized)
+                #         valid_clusters.append(cluster)
+                #
+                # return generalized_clusters, valid_clusters
+                # --- PATCH: 不丢记录：将 <k 的小簇合并进最近的大簇 ---
+                big_clusters = [c for c in clusters if len(c) >= self.k]
+                small_clusters = [c for c in clusters if 0 < len(c) < self.k]
+
+                # 极端情况：如果全部都是小簇（或 KMeans 异常），直接把整个 subset 当成一个簇
+                # （通常 Mondrian 子集大小 >= k，所以这样仍满足 k）
+                if len(big_clusters) == 0:
+                    big_clusters = [subset]
+
+                # 预先计算大簇的“质心”（用数值特征均值）
+                def _centroid(df):
+                    # 注意：numeric_columns 是你传进来的用于聚类的列（如 age/duration/campaign）
+                    return df[numeric_columns].mean().to_numpy(dtype=float)
+
+                centroids = [_centroid(c) for c in big_clusters]
+
+                # 把每个小簇合并到最近的大簇
+                for sc in small_clusters:
+                    sc_cent = _centroid(sc)
+
+                    # 找最近的大簇（欧氏距离）
+                    dists = [float(((cent - sc_cent) ** 2).sum()) for cent in centroids]
+                    j = int(min(range(len(dists)), key=lambda i: dists[i]))
+
+                    # 合并
+                    big_clusters[j] = pd.concat([big_clusters[j], sc], axis=0)
+                    # 更新该大簇质心（避免后续合并误差累积）
+                    centroids[j] = _centroid(big_clusters[j])
+
+                # 现在 big_clusters 覆盖了 subset 的所有记录，且每簇 >= k
+                generalized_clusters = [self.generalize_cluster(c, [], sensitive_attr) for c in big_clusters if
+                                        len(c) > 0]
+                valid_clusters = big_clusters
 
                 return generalized_clusters, valid_clusters
+                # --- END PATCH ---
 
         all_generalized = []
         all_clusters = []
@@ -325,9 +363,8 @@ class APMCAAlgorithmParallel:
             else:
                 generalized_record[col] = f"[{min_val},{max_val}]"
 
-        # 处理分类属性
-        categorical_columns = ['job', 'marital', 'education', 'default', 'housing',
-                               'loan', 'contact', 'month', 'poutcome']
+        # 处理分类属性（按你的 QI）
+        categorical_columns = ['marital_status', 'education', 'contact']
         categorical_columns = [col for col in categorical_columns if col in cluster_data.columns]
 
         for col in categorical_columns:
@@ -335,17 +372,15 @@ class APMCAAlgorithmParallel:
             if len(unique_values) == 1:
                 generalized_record[col] = str(unique_values[0])
             else:
-                values_list = sorted([str(v) for v in unique_values])
-                if len(values_list) > 5:
-                    generalized_record[col] = '\\'.join(values_list[:5]) + '\\...'
-                else:
-                    generalized_record[col] = '\\'.join(values_list)
+                values_list = sorted([str(v).strip().strip("'\"") for v in unique_values])
+                generalized_record[col] = '\\'.join(values_list)
 
+        generalized_record['cluster_size'] = len(cluster_data)
         # 敏感属性统计
         if sensitive_attr in cluster_data.columns:
             sensitive_stats = cluster_data[sensitive_attr].value_counts().to_dict()
             generalized_record[sensitive_attr] = sensitive_stats
-            generalized_record['cluster_size'] = len(cluster_data)
+
 
         return generalized_record
 
@@ -536,7 +571,7 @@ def load_bank_data():
                 'y': np.random.choice(['yes', 'no'], n_samples, p=[0.12, 0.88])
             })
         '''
-        excel_path = "head10000.xlsx"
+        excel_path = "a_head10000.xlsx"
         if os.path.exists(excel_path):
             #data = pd.read_csv('bank-full.csv', sep=';')
             data = pd.read_excel(excel_path, sheet_name="Sheet1")
@@ -578,14 +613,13 @@ def main():
         print(f"使用 {sample_size} 条记录的子集进行测试")
 
     # 定义准标识符和敏感属性
-    quasi_identifiers = ['age', 'job', 'marital', 'education', 'balance', 'duration', 'campaign']
-    sensitive_attr = 'y'
+
     quasi_identifiers = ['age', 'marital_status', 'education', 'contact', 'duration', 'campaign']
     sensitive_attr = 'job categorical'
 
     # 初始化并行算法
     apmca_parallel = APMCAAlgorithmParallel(
-        k=100,
+        k=8,
         e=3,
         S=6,
         variance_threshold=1000,
@@ -639,14 +673,14 @@ if __name__ == "__main__":
                 if anonymized_df[col].apply(lambda x: isinstance(x, dict) if pd.notna(x) else False).any():
                     anonymized_df[col] = anonymized_df[col].astype(str)
 
-            output_file = 'apmca_parallel_result_bank.xlsx'
+            output_file = 'apmca_parallel_result_Adult.xlsx'
             anonymized_df.to_excel(output_file, index=False)
             print(f"匿名化结果已保存到 '{output_file}'")
 
             # 保存性能指标
             metrics_df = pd.DataFrame([metrics])
-            metrics_df.to_excel('apmca_parallel_metrics_bank.xlsx', index=False)
-            print("性能指标已保存到 'apmca_parallel_metrics_bank.xlsx'")
+            metrics_df.to_excel('apmca_parallel_metrics_Adult.xlsx', index=False)
+            print("性能指标已保存到 'apmca_parallel_metrics_Adult.xlsx'")
 
 
         except Exception as e:

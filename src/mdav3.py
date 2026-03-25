@@ -318,10 +318,12 @@ class StrictKEMDAV:
 
             if Generalized_GroupR:
                 Generalized_GroupR['group_indices'] = [data.index[i] for i in GroupR]
+                Generalized_GroupR['group_size'] = len(GroupR)
                 Anonymized_Data.append(Generalized_GroupR)
 
             if Generalized_GroupS:
                 Generalized_GroupS['group_indices'] = [data.index[i] for i in GroupS]
+                Generalized_GroupS['group_size'] = len(GroupS)
                 Anonymized_Data.append(Generalized_GroupS)
 
             print(f"移除分组后剩余记录数: {len(T)}")
@@ -337,6 +339,7 @@ class StrictKEMDAV:
             Generalized_T = self.Generalize(remaining_indices, data)
             if Generalized_T:
                 Generalized_T['group_indices'] = list(T.index)
+                Generalized_T['group_size'] = len(T)
                 Anonymized_Data.append(Generalized_T)
         else:
             print("条件不满足，执行Distribute_And_Generalize_Remaining...")
@@ -380,7 +383,9 @@ class StrictKEMDAV:
         print("\n=== 创建最终匿名化数据集 ===")
         final_records = []
         for group in Anonymized_Data:
-            group_size = group.get('group_size', 1)
+            if 'group_size' not in group:
+                raise ValueError("Missing group_size in some generalized group. Fix group_size assignment.")
+            group_size = int(group['group_size'])
             for i in range(group_size):
                 record = group.copy()
                 if 'group_indices' in record:
